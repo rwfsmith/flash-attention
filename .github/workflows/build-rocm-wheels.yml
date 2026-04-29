@@ -1,0 +1,209 @@
+# Build flash-attention wheels for AMD RDNA3/3.5/4 (ROCm CK backend, Linux + Windows).
+#
+# Linux  — runs on any ubuntu-22.04 runner (self-hosted recommended for speed;
+#            a standard GitHub-hosted 2-core runner is too slow for 2700+ HIP files).
+#            Labels for a self-hosted Linux runner: [self-hosted, Linux, X64, ROCm]
+#
+# Windows — requires a self-hosted runner with:
+#             • AMD HIP SDK 7.2.2  https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html
+#             • Visual Studio 2022 Build Tools (cl.exe, link.exe)
+#           Labels: [self-hosted, Windows, X64, HIPSDK]
+#           The job is disabled by default (if: false). Remove that line once
+#           your Windows runner is configured.
+#
+# Torch version agnosticism
+# ─────────────────────────
+# C++ torch extensions link against libtorch, so a wheel built against
+# torch 2.6 is NOT binary-compatible with torch 2.7.  The CI matrix builds
+# one wheel per (Python × torch) combination and embeds the torch version in
+# the wheel filename via FLASH_ATTN_LOCAL_VERSION so users can pick the right
+# one.  The install_requires in setup.py intentionally omits torch so pip
+# never silently overwrites an existing ROCm torch with a CUDA one.
+
+name: Build ROCm Wheels (RDNA3/4)
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'setup.py'
+      - 'csrc/**'
+      - 'flash_attn/**'
+      - '.github/workflows/build-rocm-wheels.yml'
+  workflow_dispatch:
+    inputs:
+      gpu_archs:
+        description: 'GPU_ARCHS — semicolon-separated (e.g. gfx1151;gfx1201)'
+        default: 'gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201'
+        required: true
+      max_jobs:
+        description: 'MAX_JOBS — parallel ninja compile jobs'
+        default: '8'
+        required: true
+      opt_dim:
+        description: 'OPT_DIM — head-dimension variants to generate'
+        default: '64,128'
+        required: true
+
+# ── default env vars shared by all jobs ──────────────────────────────────────
+env:
+  FLASH_ATTENTION_FORCE_BUILD: 'TRUE'
+  BUILD_TARGET: rocm
+  # Fork owners: set these secrets (or change the defaults below) so the
+  # prebuilt-wheel downloader in setup.py points at your release page.
+  FLASH_ATTN_FORK_OWNER: ${{ vars.FLASH_ATTN_FORK_OWNER || 'Dao-AILab' }}
+  FLASH_ATTN_FORK_REPO:  ${{ vars.FLASH_ATTN_FORK_REPO  || 'flash-attention' }}
+
+# ── matrix defaults ───────────────────────────────────────────────────────────
+# Edit here to add/remove Python or torch versions for every trigger type.
+# workflow_dispatch inputs above override GPU_ARCHS / MAX_JOBS / OPT_DIM only.
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  build-linux:
+    name: "Linux · py${{ matrix.python }} · torch${{ matrix.torch }}"
+    # Change to [self-hosted, Linux, X64, ROCm] for a self-hosted runner, or
+    # ubuntu-22.04-16core for GitHub's larger hosted runners (costs extra).
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+        torch:  ['2.6.0', '2.7.0']
+
+    steps:
+      - name: Checkout (with CK submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Install the ROCm 7.2 SDK (includes hipcc / clang++) via pip.
+      # rocm-sdk[devel] is self-contained: no system ROCm install required.
+      - name: Install ROCm SDK devel (pip)
+        run: pip install 'rocm-sdk[devel]~=7.2.0'
+
+      # Install PyTorch from the official ROCm whl index.
+      # If rocm7.2 isn't listed yet, change to rocm7.1 or rocm6.2.
+      - name: Install PyTorch (ROCm)
+        run: |
+          pip install torch==${{ matrix.torch }} \
+            --index-url https://download.pytorch.org/whl/rocm7.2
+
+      - name: Install build-time deps
+        run: pip install ninja packaging wheel build setuptools
+
+      - name: Build wheel
+        env:
+          GPU_ARCHS:  ${{ github.event.inputs.gpu_archs || 'gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201' }}
+          MAX_JOBS:   ${{ github.event.inputs.max_jobs  || '8' }}
+          OPT_DIM:    ${{ github.event.inputs.opt_dim   || '64,128' }}
+          # Embed torch version in local version label so wheels are unique per torch.
+          FLASH_ATTN_LOCAL_VERSION: torch${{ matrix.torch }}
+        run: pip wheel . --no-build-isolation --no-deps -w dist/
+
+      - name: List built wheels
+        run: ls -lh dist/
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-py${{ matrix.python }}-torch${{ matrix.torch }}
+          path: dist/*.whl
+          retention-days: 14
+
+  # ────────────────────────────────────────────────────────────────────────────
+  build-windows:
+    name: "Windows · py${{ matrix.python }} · torch${{ matrix.torch }}"
+    # ⚠ DISABLED — remove the `if: false` line once your self-hosted Windows
+    # runner is ready.  See the file header for required prerequisites.
+    if: false
+    runs-on: [self-hosted, Windows, X64, HIPSDK]
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+        torch:  ['2.6.0', '2.7.0']
+
+    steps:
+      - name: Checkout (with CK submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Add HIP SDK bin to PATH so hipcc.exe / clang++.exe are found.
+      # Adjust the version path if your HIP SDK is installed elsewhere.
+      - name: Add HIP SDK to PATH
+        shell: pwsh
+        run: |
+          $hipBin = "C:\Program Files\AMD\ROCm\7.2.2\bin"
+          if (-not (Test-Path $hipBin)) {
+            Write-Error "HIP SDK not found at $hipBin — adjust path in workflow."
+            exit 1
+          }
+          "$hipBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # Official PyTorch ROCm wheels are Linux-only as of mid-2026.
+      # Replace this step with your own ROCm-enabled Windows torch distribution.
+      - name: Install PyTorch (ROCm — Windows)
+        run: |
+          pip install torch==${{ matrix.torch }} `
+            --index-url https://download.pytorch.org/whl/rocm7.2
+
+      - name: Install build-time deps
+        run: pip install ninja packaging wheel build setuptools
+
+      - name: Build wheel
+        env:
+          GPU_ARCHS:  ${{ github.event.inputs.gpu_archs || 'gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201' }}
+          MAX_JOBS:   ${{ github.event.inputs.max_jobs  || '8' }}
+          OPT_DIM:    ${{ github.event.inputs.opt_dim   || '64,128' }}
+          FLASH_ATTN_LOCAL_VERSION: torch${{ matrix.torch }}
+        run: pip wheel . --no-build-isolation --no-deps -w dist\
+
+      - name: List built wheels
+        run: dir dist\
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows-py${{ matrix.python }}-torch${{ matrix.torch }}
+          path: dist\*.whl
+          retention-days: 14
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Attach all wheels to the GitHub Release when a version tag is pushed.
+  release:
+    name: Publish to GitHub Release
+    needs: [build-linux]   # add build-windows once enabled
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Display release wheels
+        run: ls -lh dist/
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          fail_on_unmatched_files: false

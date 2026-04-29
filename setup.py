@@ -54,8 +54,11 @@ else:
 
 PACKAGE_NAME = "flash_attn"
 
+# Allow forks to redirect prebuilt-wheel downloads to their own GitHub release page.
+_fork_owner = os.getenv("FLASH_ATTN_FORK_OWNER", "Dao-AILab")
+_fork_repo = os.getenv("FLASH_ATTN_FORK_REPO", "flash-attention")
 BASE_WHEEL_URL = (
-    "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
+    f"https://github.com/{_fork_owner}/{_fork_repo}/releases/download/{{tag_name}}/{{wheel_name}}"
 )
 
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
@@ -199,8 +202,9 @@ def rename_cpp_to_cu(cpp_files):
 
 
 def validate_and_update_archs(archs):
-    # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"]
+    # RDNA3/3.5/4 only — CDNA (gfx90a/gfx942/gfx950) intentionally excluded;
+    # CK FMHA requires WMMA which is only available on RDNA3+ (gfx11xx/gfx12xx).
+    allowed_archs = ["native", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -404,7 +408,10 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             os.makedirs("build")
 
         optdim = os.getenv("OPT_DIM", "32,64,128,256")
-        archs = [arch.lower() for arch in os.getenv("GPU_ARCHS", "native").split(";")]
+        # Default to all supported RDNA3/3.5/4 targets so cross-compilation
+        # works in CI without a physical GPU present.
+        _RDNA_DEFAULT_ARCHS = "gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
+        archs = [arch.lower() for arch in os.getenv("GPU_ARCHS", _RDNA_DEFAULT_ARCHS).split(";")]
         validate_and_update_archs(archs)
 
         if archs != ["native"]:
@@ -498,6 +505,16 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             has_gfx11_target = any(arch.startswith("gfx11") for arch in kernel_targets)
             ck_tile_float_to_bfloat16_default = "0" if has_gfx11_target else "3"
         cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={ck_tile_float_to_bfloat16_default}"]
+
+        # Newer clang (ROCm 6+) no longer pre-defines __AMDGCN_WAVEFRONT_SIZE, but
+        # system HIP headers (e.g. ROCm 5.x) reference it. Define it explicitly for
+        # RDNA (gfx11xx, gfx12xx) which use wave32, and CDNA/older (gfx9xx) which use wave64.
+        has_rdna_target = any(arch.startswith("gfx11") or arch.startswith("gfx12") for arch in kernel_targets)
+        has_cdna_target = any(arch.startswith("gfx9") for arch in kernel_targets)
+        if has_rdna_target and not has_cdna_target:
+            cc_flag += ["-D__AMDGCN_WAVEFRONT_SIZE=32"]
+        elif has_cdna_target and not has_rdna_target:
+            cc_flag += ["-D__AMDGCN_WAVEFRONT_SIZE=64"]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()
@@ -676,8 +693,10 @@ if ROCM_BACKEND == "triton":
         "triton==3.5.1",
     ]
 else:
+    # torch is intentionally omitted: pip would resolve it to the CUDA build on
+    # PyPI, overwriting any ROCm torch the user already has.  Users must install
+    # a ROCm-compatible torch before installing flash-attn.
     install_requires = [
-        "torch",
         "einops",
     ]
 
